@@ -76,7 +76,7 @@ trait PolyDraw {
     fn on_mouse_l_button_up(&mut self, x: i32, y: i32) {}
     fn on_mouse_move(&mut self, x: i32, y: i32) {}
 
-    fn on_paint(&mut self, hdc: HDC) {}
+    fn on_paint(&mut self, window: HWND, hdc: HDC) {}
     
     fn window_size(&self) -> (i32, i32) {
         (640, 480)
@@ -215,10 +215,27 @@ mod polydraw_lines {
             println!("MOUSE MOVE X: {x}, Y: {y}");
         }
 
-        fn on_paint(&mut self, hdc: HDC) {
+        fn on_paint(&mut self, window: HWND, hdc: HDC) {
             (|| -> Result<()>  {
                 let mut graphics:Graphics = Graphics::from_hdc(hdc)?;
                 let mut pen = Pen::new(&Color::from(RED), 1.0)?;
+
+                let mut rect = RECT::default();
+                unsafe { GetClientRect(window, &mut rect) };
+    
+                rect.left -= 1;
+                rect.top -= 1;
+                rect.right += 1;
+                rect.bottom += 1;
+
+                graphics
+                    .with_brush(&mut SolidBrush::new(&Color::from(WHITE))?)
+                    .fill_rectangle(
+                        (rect.left as _, rect.top as _),
+                        rect.right as _,
+                        rect.bottom as _
+                    )?;
+
                 let last_pos = 
                     graphics
                         .with_pen(&mut pen)
@@ -227,8 +244,6 @@ mod polydraw_lines {
                 Ok(())
             })()
             .unwrap();
-
-
         }
 
     }
@@ -267,7 +282,8 @@ fn polyd_wndproc<P: PolyDraw>(poly: &mut P, window: HWND, message: u32, wparam: 
             let hdc: HDC;
             let mut ps: PAINTSTRUCT = PAINTSTRUCT::default();
             hdc = unsafe{ BeginPaint(window,   &mut ps) };
-            poly.on_paint(hdc);
+         
+            poly.on_paint(window, hdc);
             unsafe{ EndPaint(window, &ps) };
             // poly.update();
             // poly.render();
@@ -303,6 +319,7 @@ pub const Status_Ok: Status = 0;
 pub use self::{ Status as GpStatus, Unit as GpUnit };
 pub const BLACK: u32 = 0xff000000;
 pub const RED: u32 = 0xffff0000;
+pub const WHITE: u32 = 0xffffffff;
 pub type Result<T> = core::result::Result<T, Error>;
 
 macro_rules! DECLARE_HANDLE {
@@ -325,6 +342,38 @@ pub struct GpGraphics {
 #[derive(Debug, Copy, Clone)]
 pub struct GpPen {
     pub _address: u8
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GpBrush {
+    pub _address: u8
+}
+extern "C" {
+    #[link_name = "\u{1}GdipDeleteBrush"]
+    pub fn GdipDeleteBrush(brush: *mut GpBrush) -> GpStatus;
+}
+extern "C" {
+    #[link_name = "\u{1}GdipCloneBrush"]
+    pub fn GdipCloneBrush(brush: *mut GpBrush, cloneBrush: *mut *mut GpBrush) -> GpStatus;
+}
+extern "C" {
+    #[link_name = "\u{1}GdipGraphicsClear"]
+    pub fn GdipGraphicsClear(graphics: *mut GpGraphics, color: ARGB) -> GpStatus;
+}
+extern "C" {
+    #[link_name = "\u{1}GdipGetPenBrushFill"]
+    pub fn GdipGetPenBrushFill(pen: *mut GpPen, brush: *mut *mut GpBrush) -> GpStatus;
+}
+extern "C" {
+    #[link_name = "\u{1}GdipFillRectangle"]
+    pub fn GdipFillRectangle(
+        graphics: *mut GpGraphics,
+        brush: *mut GpBrush,
+        x: REAL,
+        y: REAL,
+        width: REAL,
+        height: REAL,
+    ) -> GpStatus;
 }
 extern "C" {
     #[link_name = "\u{1}GdipCreateFromHDC"]
@@ -413,6 +462,39 @@ impl Graphics {
 
     pub fn with_pen<'a>(&'a mut self, pen: &'a mut Pen) -> WithPen<'a> {
         WithPen::new(self, pen)
+    }
+
+    pub fn with_brush<'a>(&'a mut self, brush: &'a mut SolidBrush) -> WithBrush<'a> {
+        WithBrush::new(self, brush)
+    }
+
+
+}
+
+pub struct WithBrush<'a> {
+    graphics: &'a mut Graphics,
+    brush: &'a mut SolidBrush,
+}
+impl <'a> WithBrush<'a> {
+    pub fn new (graphics: &'a mut Graphics, brush: &'a mut SolidBrush) -> Self {
+        Self { graphics, brush }
+    }
+
+    pub fn fill_rectangle (
+        &mut self,
+        position: Point,
+        width: REAL,
+        height: REAL,
+    ) -> Result<&mut Self> {
+        return_iferror!(GdipFillRectangle(
+            self.graphics.graphics(),
+            self.brush.brush(),
+            position.0,
+            position.1,
+            width,
+            height
+        ));
+        Ok(self)
     }
 }
 
@@ -540,6 +622,42 @@ impl GdiPlus {
 impl Drop for GdiPlus {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+pub struct SolidBrush {
+    brush: *mut GpBrush,
+}
+impl SolidBrush {
+    pub (crate) fn brush(&self) -> *mut GpBrush {
+        self.brush
+    }
+
+    pub fn new(color: &Color) -> Result<Self> {
+        let pen = Pen::new(color, 0.0)?;
+        let mut brush = MaybeUninit::uninit();
+
+        return_iferror!(GdipGetPenBrushFill(pen.pen(), brush.as_mut_ptr()));
+
+        Ok(Self {
+            brush: unsafe { brush.assume_init() }
+        })
+
+    }
+
+    
+    pub fn try_clone(&self) -> Result<Self> {
+        let mut brush = MaybeUninit::uninit();
+        return_iferror!(GdipCloneBrush(self.brush, brush.as_mut_ptr()));
+
+        Ok(Self {
+            brush: unsafe { brush.assume_init() }
+        })
+    }
+}
+impl Drop for SolidBrush {
+    fn drop(&mut self) {
+        unsafe {GdipDeleteBrush(self.brush)};
     }
 }
 
