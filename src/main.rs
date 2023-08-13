@@ -4,11 +4,21 @@ use windows::{
     //Win32::Graphics::Gdi::ValidateRect,
     Win32::System::LibraryLoader::GetModuleHandleA,
     Win32::UI::WindowsAndMessaging::*,
-    Win32::Graphics::Gdi::*
+    Win32::Graphics::Gdi::*,
 };
 
 use std::mem::transmute;
 use std::mem::MaybeUninit;
+use std::ptr;
+use std::ffi::OsStr;
+use std::os::windows::prelude::OsStrExt;
+
+pub fn wide_string(s: &str) -> Vec<u16> {
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
 
 pub mod ctypes {
     #[cfg(feature = "std")]
@@ -43,6 +53,9 @@ pub mod ctypes {
 
 pub type DWORD = ctypes::c_ulong;
 pub type WORD = ctypes::c_ushort;
+pub type WCHAR = ctypes::wchar_t;
+pub type LPCSTR = *const CHAR;
+pub type LPCWSTR = *const WCHAR;
 
 #[inline]
 pub fn HIWORD(l: DWORD) -> WORD {
@@ -159,8 +172,27 @@ where
         )
     };
 
+    /*let h_inst = wpanic_ifisnull!( GetModuleHandleW(ptr::null()) );
+    wpanic_ifisnull!( 
+        CreateWindowExW(
+            0,
+            wide_string("BUTTON").as_ptr(),
+            wide_string("Button").as_ptr(),
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            4,
+            40,
+            100,
+            30,
+            hwnd,
+            ptr::null_mut(),
+            h_inst,
+            ptr::null_mut()
+        )
+    );*/
+
     poly.bind_to_window(&hwnd)?;
     unsafe { ShowWindow(hwnd, SW_SHOW) };
+    unsafe { UpdateWindow(hwnd) };
 
     loop {
         let mut message = MSG::default();
@@ -182,12 +214,20 @@ mod polydraw_lines {
     use super::*;
 
     pub struct PolyD {
-
+        drawing: bool,
+        startpt: Point,
+        endpt: Point,
+        currentpt: Point
     }
 
     impl PolyDraw for PolyD {
         fn new (command_line: &PolyDrawCommandLine) -> Result<Self> {
-            Ok(PolyD{})
+            Ok(PolyD{
+                drawing: false,
+                startpt: Point::default(),
+                endpt: Point::default(),
+                currentpt: Point::default()
+            })
         }
 
         fn bind_to_window(&mut self, hwnd: &HWND) -> Result<()> {
@@ -204,15 +244,24 @@ mod polydraw_lines {
         }
 
         fn on_mouse_l_button_down(&mut self, x: i32, y: i32) {
+            self.drawing = true;
+            self.startpt = (x as REAL, y as REAL);
             println!("MOUSE BUTTON LEFT DOWN X: {x}, Y: {y}");
         }
 
         fn on_mouse_l_button_up(&mut self, x: i32, y: i32) {
+            self.drawing = false;
+            self.endpt = (x as REAL, y as REAL);
             println!("MOUSE BUTTON LEFT UP X: {x}, Y: {y}");
         }
 
-        fn on_mouse_move(&mut self, x: i32, y: i32) {
-            println!("MOUSE MOVE X: {x}, Y: {y}");
+        fn on_mouse_move(&mut self, x: i32, y: i32) {            
+            self.currentpt = (x as REAL, y as REAL);
+            let mut drawing_status = "false";
+            if self.drawing == true {
+                drawing_status = "true";
+            }
+            println!("MOUSE MOVE X: {x}, Y: {y}, drawing: {drawing_status}");
         }
 
         fn on_paint(&mut self, window: HWND, hdc: HDC) {
@@ -235,12 +284,18 @@ mod polydraw_lines {
                         rect.right as _,
                         rect.bottom as _
                     )?;
+                    
+                if self.drawing == true {
+                    self.endpt = self.currentpt;
+                    let last_pos = 
+                        graphics
+                            .with_pen(&mut pen)
+                            .draw_line((self.startpt.0, self.startpt.0), (self.endpt.0, self.endpt.1))?
+                            .current_pos();
+                }
 
-                let last_pos = 
-                    graphics
-                        .with_pen(&mut pen)
-                        .draw_line((20.0, 50.0), (200.0, 50.0))?
-                        .current_pos();
+                let text = "PolyDraw by Christian ZeroBit";
+                unsafe { TextOutA(hdc, 100, 100, text.as_ptr() as *const i8, text.len() as i32) };
                 Ok(())
             })()
             .unwrap();
@@ -311,6 +366,7 @@ pub type ULONG_PTR = usize;
 pub type UINT32 = ctypes::c_uint;
 pub type PVOID = *mut ctypes::c_void;
 pub const NULL: PVOID = 0 as PVOID;
+pub const BS_DEFPUSHBUTTON: DWORD = 0x00000001;
 pub type CHAR = ctypes::c_char;
 // x,y
 pub type Point = (REAL, REAL);
@@ -351,6 +407,10 @@ pub struct GpBrush {
 extern "C" {
     #[link_name = "\u{1}GdipDeleteBrush"]
     pub fn GdipDeleteBrush(brush: *mut GpBrush) -> GpStatus;
+}
+extern "C" {
+    #[link_name = "\u{1}TextOutA"]
+    pub fn TextOutA(hdc: HDC, x: ctypes::c_int, y: ctypes::c_int, lpString: LPCSTR, c: ctypes::c_int) -> BOOL;
 }
 extern "C" {
     #[link_name = "\u{1}GdipCloneBrush"]
@@ -435,6 +495,16 @@ pub struct Graphics {
     graphics: *mut GpGraphics,
 }
 
+#[macro_export]
+macro_rules! wpanic_ifisnull {
+    ($code:expr) => {{
+        let res = unsafe{ $code };
+        if res.is_null() {
+            std::panic::panic_any(std::io::Error::last_os_error());
+        }
+        res
+    }};
+}
 #[macro_export]
 macro_rules! return_iferror{
     ($code:expr) => {{
@@ -663,6 +733,7 @@ impl Drop for SolidBrush {
 
 extern "system" {
     pub fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) -> BOOL;
+    pub fn GetModuleHandleW(lpModuleName: LPCWSTR) -> HMODULE;
 }
 
 extern "system" fn wndproc<P: PolyDraw>(
